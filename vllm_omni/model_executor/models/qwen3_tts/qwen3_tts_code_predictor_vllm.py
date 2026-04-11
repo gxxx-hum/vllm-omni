@@ -18,6 +18,10 @@ from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTS
 
 logger = init_logger(__name__)
 
+if current_omni_platform.is_npu():
+    import torch_npu
+else:
+    torch_npu = None
 
 # ===================================================================
 #  HF-numerics-compatible layers for code predictor
@@ -98,6 +102,9 @@ class _CodePredictorAttention(nn.Module):
 
     Uses F.scaled_dot_product_attention with HF-compatible RoPE and RMSNorm.
     Input: [B, seq_len, hidden_size], output: [B, seq_len, hidden_size].
+
+    GPU/CPU: ``F.scaled_dot_product_attention``.
+    NPU: ``torch_npu.npu_fusion_attention``.
     """
 
     def __init__(
@@ -117,6 +124,7 @@ class _CodePredictorAttention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self._use_gqa = self.num_kv_heads != self.num_heads
+        self._n_rep = self.num_heads // self.num_kv_heads if self._use_gqa else 1
 
         # Separate q/k/v projections matching HF (no fused packing)
         self.q_proj = nn.Linear(
@@ -142,6 +150,15 @@ class _CodePredictorAttention(nn.Module):
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+        if current_omni_platform.is_npu():
+            # Ascend SDPA is_causal migration example uses a fixed 2048x2048
+            # compressed causal mask with sparse_mode=2.
+            fusion_mask = torch.triu(
+                torch.ones(2048, 2048, dtype=torch.bool),
+                diagonal=1,
+            )
+            self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -162,14 +179,53 @@ class _CodePredictorAttention(nn.Module):
         q = (q * cos) + (_rotate_half(q) * sin)
         k = (k * cos) + (_rotate_half(k) * sin)
 
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=self.scaling,
-            is_causal=True,
-            enable_gqa=self._use_gqa,
-        )
+        if not current_omni_platform.is_npu():
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scaling,
+                is_causal=True,
+                enable_gqa=self._use_gqa,
+            )
+        else:
+            q_f, k_f, v_f = q, k, v
+            if self._use_gqa:
+                k_f = k[:, :, None, :, :].expand(
+                    bsz, self.num_kv_heads, self._n_rep, seq_len, self.head_dim
+                ).reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                v_f = v[:, :, None, :, :].expand(
+                    bsz, self.num_kv_heads, self._n_rep, seq_len, self.head_dim
+                ).reshape(bsz, self.num_heads, seq_len, self.head_dim)
+
+            mask = self._fusion_causal_mask
+            mask = mask.contiguous()
+            q_f = q_f.contiguous()
+            k_f = k_f.contiguous()
+            v_f = v_f.contiguous()
+            attn_out = torch_npu.npu_fusion_attention(
+                q_f,
+                k_f,
+                v_f,
+                self.num_heads,
+                "BNSD",
+                pse=None,
+                padding_mask=None,
+                atten_mask=mask,
+                scale=float(self.scaling),
+                keep_prob=1.0,
+                pre_tockens=2147483647,
+                next_tockens=2147483647,
+                inner_precise=0,
+                prefix=None,
+                actual_seq_qlen=None,
+                actual_seq_kvlen=None,
+                # Ascend SDPA is_causal migration example uses sparse_mode=2.
+                sparse_mode=2,
+                gen_mask_parallel=True,
+                # Keep sync=True for the NPU fused attention path.
+                sync=True,
+            )[0]
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.o_proj(attn_out)
@@ -356,7 +412,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._bucket_pos_ids: dict[int, torch.Tensor] = {}
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
-        self._cuda_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        # Device graphs: stores (graph_object, static_output) for any platform.
+        # Both torch.cuda.CUDAGraph and torch.npu.NPUGraph have .replay().
+        self._device_graphs: dict[int, tuple] = {}
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -402,7 +460,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         )
 
     def _setup_compile(self) -> None:
-        """Lazily set up torch.compile with manual CUDA graph capture."""
+        """Lazily set up torch.compile and/or device graph capture."""
         if self._compiled_model_fwd is not None:
             return
         # Cache model parameter dtype so forward() doesn't need to query it
@@ -411,25 +469,38 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._model_dtype = next(self.model.parameters()).dtype
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
-        if not current_omni_platform.supports_torch_inductor():
-            logger.warning_once("code_predictor: torch.compile disabled")
-            self._compiled_model_fwd = self.model.forward
-            return
 
-        # torch.compile fuses RMSNorm/RoPE in ways that lose float32
-        # precision, compounding across 15 AR steps.  Use torch.compile
-        # with options that disable the problematic fusions while still
-        # getting kernel fusion benefits for the linear layers and SDPA.
-        self._compiled_model_fwd = torch.compile(
-            self.model.forward,
-            dynamic=False,
-            options={
-                "epilogue_fusion": False,
-            },
-        )
-        self._warmup_buckets()
-        self._capture_cuda_graphs()
-        logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
+        if current_omni_platform.supports_torch_inductor():
+            # torch.compile fuses RMSNorm/RoPE in ways that lose float32
+            # precision, compounding across 15 AR steps. Use torch.compile
+            # with options that disable the problematic fusions while still
+            # getting kernel fusion benefits for the linear layers and SDPA.
+            self._compiled_model_fwd = torch.compile(
+                self.model.forward,
+                dynamic=False,
+                options={"epilogue_fusion": False},
+            )
+            self._warmup_buckets()
+            self._capture_cuda_graphs()
+            logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
+        elif current_omni_platform.is_npu():
+            # NPU: no torch.compile/Inductor; optional NPUGraph on the 5-layer forward.
+            attn0 = self.model.layers[0].self_attn
+            logger.info(
+                "code_predictor [NPU]: attention=npu_fusion_attention, gqa=%s, "
+                "fusion_sparse_mode=%s, fusion_mask=%dx%d, fusion_sync=%s",
+                getattr(attn0, "_use_gqa", False),
+                2,
+                2048,
+                2048,
+                True,
+            )
+            self._compiled_model_fwd = self.model.forward
+            self._warmup_buckets()
+            self._capture_npu_graphs()
+        else:
+            logger.warning_once("code_predictor: torch.compile disabled, no device graph")
+            self._compiled_model_fwd = self.model.forward
 
     def _padded_bsz(self, bsz: int) -> int:
         for bucket in self._bucket_sizes:
@@ -477,9 +548,35 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             with torch.cuda.graph(g, pool=pool):
                 static_output = self._compiled_model_fwd(static_input, pos_ids)
 
-            self._cuda_graphs[bsz] = (g, static_output)
+            self._device_graphs[bsz] = (g, static_output)
 
         logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
+
+    def _capture_npu_graphs(self) -> None:
+        """Capture an NPU graph per batch-size bucket.
+
+        Uses torch_npu's NPUGraph API (mirrors CUDA graph API) to capture
+        the 5-layer transformer forward into replayable graphs. The AR loop,
+        lm_head projection, and sampling stay eager.
+        """
+        max_seq = self._num_groups + 1
+        proj_buf = self._proj_buf
+        pool = torch.npu.graph_pool_handle()
+
+        # Capture graphs using the regular forward with static position_ids.
+        for bsz in self._bucket_sizes:
+            static_input = proj_buf[:bsz, :max_seq, :]
+            pos_ids = self._bucket_pos_ids[bsz]
+
+            g = torch.npu.NPUGraph()
+            with torch.npu.graph(g, pool=pool):
+                static_output = self.model.forward(static_input, pos_ids)
+            self._device_graphs[bsz] = (g, static_output)
+
+        logger.info(
+            "code_predictor: captured NPU graphs for buckets %s",
+            self._bucket_sizes,
+        )
 
     # ------------------------------------------------------------------
     #  Optimized forward: re-prefill + torch.compile + projection cache
@@ -541,13 +638,13 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         if full_pos_ids is None:
             full_pos_ids = torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1)
 
-        # Use captured CUDA graph if available, otherwise call compiled fn.
-        cuda_graph_entry = self._cuda_graphs.get(padded_bsz)
+        # Use captured device graph (CUDA or NPU) if available.
+        graph_entry = self._device_graphs.get(padded_bsz)
 
         for step in range(1, num_groups):
-            if cuda_graph_entry is not None:
-                cuda_graph_entry[0].replay()
-                hidden_out = cuda_graph_entry[1]
+            if graph_entry is not None:
+                graph_entry[0].replay()
+                hidden_out = graph_entry[1]
             else:
                 hidden_out = model_fwd(proj_buf[:padded_bsz, :max_seq, :], full_pos_ids)
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
