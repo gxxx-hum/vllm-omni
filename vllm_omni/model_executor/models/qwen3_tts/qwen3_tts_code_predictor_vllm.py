@@ -151,6 +151,13 @@ class _CodePredictorAttention(nn.Module):
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         if current_omni_platform.is_npu():
+            # Code predictor sequence length is bounded by num_code_groups + 1,
+            max_seq = int(config.num_code_groups) + 1
+            if max_seq > 2048:
+                raise ValueError(
+                    "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
+                    f"causal mask, but max_seq={max_seq} exceeds the mask size."
+                )
             # Ascend SDPA is_causal migration example uses a fixed 2048x2048
             # compressed causal mask with sparse_mode=2.
             fusion_mask = torch.triu(
@@ -191,12 +198,16 @@ class _CodePredictorAttention(nn.Module):
         else:
             q_f, k_f, v_f = q, k, v
             if self._use_gqa:
-                k_f = k[:, :, None, :, :].expand(
-                    bsz, self.num_kv_heads, self._n_rep, seq_len, self.head_dim
-                ).reshape(bsz, self.num_heads, seq_len, self.head_dim)
-                v_f = v[:, :, None, :, :].expand(
-                    bsz, self.num_kv_heads, self._n_rep, seq_len, self.head_dim
-                ).reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                k_f = (
+                    k[:, :, None, :, :]
+                    .expand(bsz, self.num_kv_heads, self._n_rep, seq_len, self.head_dim)
+                    .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                )
+                v_f = (
+                    v[:, :, None, :, :]
+                    .expand(bsz, self.num_kv_heads, self._n_rep, seq_len, self.head_dim)
+                    .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                )
 
             mask = self._fusion_causal_mask
             mask = mask.contiguous()
@@ -214,8 +225,8 @@ class _CodePredictorAttention(nn.Module):
                 atten_mask=mask,
                 scale=float(self.scaling),
                 keep_prob=1.0,
-                pre_tockens=2147483647,
-                next_tockens=2147483647,
+                pre_tokens=2147483647,
+                next_tokens=2147483647,
                 inner_precise=0,
                 prefix=None,
                 actual_seq_qlen=None,
@@ -484,17 +495,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             self._capture_cuda_graphs()
             logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
         elif current_omni_platform.is_npu():
-            # NPU: no torch.compile/Inductor; optional NPUGraph on the 5-layer forward.
-            attn0 = self.model.layers[0].self_attn
-            logger.info(
-                "code_predictor [NPU]: attention=npu_fusion_attention, gqa=%s, "
-                "fusion_sparse_mode=%s, fusion_mask=%dx%d, fusion_sync=%s",
-                getattr(attn0, "_use_gqa", False),
-                2,
-                2048,
-                2048,
-                True,
-            )
             self._compiled_model_fwd = self.model.forward
             self._warmup_buckets()
             self._capture_npu_graphs()
