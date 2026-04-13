@@ -225,6 +225,7 @@ class _CodePredictorAttention(nn.Module):
                 atten_mask=mask,
                 scale=float(self.scaling),
                 keep_prob=1.0,
+                # Keep torch_npu's API spelling.
                 pre_tockens=2147483647,
                 next_tockens=2147483647,
                 inner_precise=0,
