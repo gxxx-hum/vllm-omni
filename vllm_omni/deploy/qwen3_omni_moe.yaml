@@ -67,10 +67,11 @@ platforms:
       - stage_id: 0
         gpu_memory_utilization: 0.6
         tensor_parallel_size: 2
+        max_num_batched_tokens: 8192
         devices: "0,1"
       - stage_id: 1
         gpu_memory_utilization: 0.6
-        enforce_eager: true
+        max_num_batched_tokens: 8192
         devices: "2"
       - stage_id: 2
         gpu_memory_utilization: 0.3
