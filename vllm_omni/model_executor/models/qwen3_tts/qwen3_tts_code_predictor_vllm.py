@@ -19,6 +19,7 @@ from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTS
 # Backward-compat alias used by tests
 Qwen3TTSTalkerCodePredictorModelVLLM = CodePredictorBaseModel
 
+
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapper):
     """Qwen3-TTS code predictor (CUDA graphs, per-call sampling, projection)."""
 
