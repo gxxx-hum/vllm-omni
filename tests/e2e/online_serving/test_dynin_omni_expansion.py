@@ -15,9 +15,9 @@ import pytest
 import soundfile as sf
 from vllm.assets.image import ImageAsset
 
-from tests import conftest as tests_conftest
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import convert_audio_bytes_to_text
+from tests.helpers.runtime import OmniServerParams
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -30,7 +30,7 @@ T2I_PROMPT = "A high quality detailed living room interior photo."
 T2S_PROMPT = "Please read this sentence naturally: Hello from Dynin-Omni online serving."
 I2I_PROMPT = "Transform this outdoor nature boardwalk scene into a painting style with vivid colors."
 
-TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG)]
+TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG, stage_init_timeout=600)]
 _STAGE_COUNT = 3
 _I2I_STAGE_SAMPLING = {"max_tokens": 1, "temperature": 0.0, "top_p": 1.0, "detokenize": False}
 
@@ -87,7 +87,7 @@ def _convert_audio_bytes_to_text_without_ffmpeg(raw_bytes: bytes) -> str:
 @pytest.fixture
 def dynin_t2s_openai_client(openai_client, monkeypatch):
     monkeypatch.setattr(
-        tests_conftest,
+        convert_audio_bytes_to_text,
         "convert_audio_bytes_to_text",
         _convert_audio_bytes_to_text_without_ffmpeg,
     )
@@ -120,7 +120,7 @@ def _build_i2i_messages(prompt: str) -> list[dict]:
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_i2i_request_001(omni_server, openai_client) -> None:
     request_config = {
@@ -136,7 +136,7 @@ def test_send_i2i_request_001(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_t2i_request_001(omni_server, openai_client) -> None:
     request_config = {
@@ -149,7 +149,7 @@ def test_send_t2i_request_001(omni_server, openai_client) -> None:
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_t2s_request_001(omni_server, dynin_t2s_openai_client) -> None:
     request_config = {
