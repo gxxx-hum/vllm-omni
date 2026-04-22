@@ -17,7 +17,7 @@ class Qwen3OmniMoeTalkerCodePredictor(CodePredictorWrapper):
             vllm_config=vllm_config,
             cp_config=cp_config,
             wrapper_config=CodePredictorWrapperConfig(
-                use_cuda_graphs=False,
+                use_cuda_graphs=True,
                 use_parallel_embedding=True,
                 use_projection=False,
                 return_proj_buf=True,

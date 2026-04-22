@@ -132,7 +132,7 @@ class CodePredictorAttention(nn.Module):
         )
         self.hidden_size = config.hidden_size
         self.scaling = self.head_dim**-0.5
-        self.max_seq_len = getattr(config, "num_code_groups", 16) + 1
+        self.max_seq = int(config.num_code_groups) + 1
 
         # Separate q/k/v projections matching HF (no fused packing)
         bias = getattr(config, "attention_bias", False)
@@ -143,38 +143,71 @@ class CodePredictorAttention(nn.Module):
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # NPU: pre-allocate causal mask for npu_fusion_attention
         if current_omni_platform.is_npu():
-            causal_mask = torch.triu(
-                torch.ones(self.max_seq_len, self.max_seq_len, dtype=torch.bool),
+            if self.max_seq > 2048:
+                raise ValueError(
+                    "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
+                    f"causal mask, but max_seq={self.max_seq} exceeds the mask size."
+                )
+            # Ascend SDPA is_causal migration example uses a fixed 2048x2048
+            # compressed causal mask with sparse_mode=2.
+            fusion_mask = torch.triu(
+                torch.ones(2048, 2048, dtype=torch.bool),
                 diagonal=1,
             )
-            self.register_buffer("_npu_causal_mask", causal_mask, persistent=False)
+            self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
 
     def _forward_npu_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        bsz: int,
         seq_len: int,
     ) -> torch.Tensor:
         import torch_npu
 
-        if seq_len > self.max_seq_len:
-            raise ValueError(f"Sequence length {seq_len} exceeds max {self.max_seq_len}")
-
+        q_f, k_f, v_f = q, k, v
         if self.is_gqa:
-            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
-            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
-        atten_mask = self._npu_causal_mask[:seq_len, :seq_len]
+            k_f = (
+                k[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
+                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+            )
+            v_f = (
+                v[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
+                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+            )
+
+        mask = self._fusion_causal_mask
+        mask = mask.contiguous()
+        q_f = q_f.contiguous()
+        k_f = k_f.contiguous()
+        v_f = v_f.contiguous()
         return torch_npu.npu_fusion_attention(
-            query=q,
-            key=k,
-            value=v,
-            head_num=self.num_heads,
-            input_layout="BNSD",
-            atten_mask=atten_mask,
-            scale=self.scaling,
+            q_f,
+            k_f,
+            v_f,
+            self.num_heads,
+            "BNSD",
+            pse=None,
+            padding_mask=None,
+            atten_mask=mask,
+            scale=float(self.scaling),
+            keep_prob=1.0,
+            # Keep torch_npu's API spelling.
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            inner_precise=0,
+            prefix=None,
+            actual_seq_qlen=None,
+            actual_seq_kvlen=None,
+            # Ascend SDPA is_causal migration example uses sparse_mode=2.
+            sparse_mode=2,
+            gen_mask_parallel=True,
+            # Keep sync=True for the NPU fused attention path.
+            sync=True,
         )[0]
 
     def forward(
@@ -197,10 +230,7 @@ class CodePredictorAttention(nn.Module):
         q = (q * cos) + (_rotate_half(q) * sin)
         k = (k * cos) + (_rotate_half(k) * sin)
 
-        if current_omni_platform.is_npu():
-            attn_out = self._forward_npu_attention(q, k, v, seq_len)
-        else:
-            # GPU/CPU path: use PyTorch's SDPA with native GQA support
+        if not current_omni_platform.is_npu():
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -209,6 +239,8 @@ class CodePredictorAttention(nn.Module):
                 is_causal=True,
                 enable_gqa=self.is_gqa,
             )
+        else:
+            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -548,15 +580,14 @@ class CodePredictorWrapper(nn.Module):
         """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
         max_seq = self._num_groups + 1
         proj_buf = self._proj_buf
-
-        import torch_npu
+        pool = torch.npu.graph_pool_handle()
 
         for bsz in self._bucket_sizes:
             static_input = proj_buf[:bsz, :max_seq, :]
             pos_ids = self._bucket_pos_ids[bsz]
 
-            g = torch_npu.npu.NPUGraph()
-            with torch_npu.npu.graph(g):
+            g = torch.npu.NPUGraph()
+            with torch.npu.graph(g, pool=pool):
                 static_output = self._compiled_model_fwd(static_input, pos_ids)
 
             self._device_graphs[bsz] = (g, static_output)
