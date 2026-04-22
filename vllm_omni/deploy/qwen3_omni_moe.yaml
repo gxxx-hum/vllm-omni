@@ -35,6 +35,7 @@ stages:
   - stage_id: 1
     gpu_memory_utilization: 0.6
     devices: "1"
+    enforce_eager: true
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:
