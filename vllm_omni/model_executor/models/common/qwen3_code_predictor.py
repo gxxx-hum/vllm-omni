@@ -143,15 +143,14 @@ class CodePredictorAttention(nn.Module):
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # NPU fusion attention requires a pre-allocated causal mask
+        # NPU: pre-allocate causal mask for npu_fusion_attention
         if current_omni_platform.is_npu():
-            # GQA expansion ratio for NPU (which doesn't support native GQA)
+            # GQA expansion ratio (NPU npu_fusion_attention doesn't support native GQA)
             self._n_rep = self.num_heads // self.num_kv_heads
-            # Fixed 2048x2048 causal mask for NPU fusion attention
-            # This is sufficient for code predictor's short sequences (num_code_groups + 1)
-            max_npu_seq_len = 2048
+            # Causal mask sized to actual max sequence length
+            self._max_seq_len = getattr(config, "num_code_groups", 16) + 1
             causal_mask = torch.triu(
-                torch.ones(max_npu_seq_len, max_npu_seq_len, dtype=torch.bool),
+                torch.ones(self._max_seq_len, self._max_seq_len, dtype=torch.bool),
                 diagonal=1,
             )
             self.register_buffer("_npu_causal_mask", causal_mask, persistent=False)
@@ -178,16 +177,18 @@ class CodePredictorAttention(nn.Module):
 
         if current_omni_platform.is_npu():
             # NPU path: use npu_fusion_attention with explicit GQA expansion
-            assert seq_len <= 2048, f"Sequence length {seq_len} exceeds NPU causal mask size 2048"
+            if seq_len > self._max_seq_len:
+                raise ValueError(
+                    f"Sequence length {seq_len} exceeds max {self._max_seq_len}"
+                )
 
-            # Expand K/V for GQA (NPU doesn't support native GQA)
+            # Expand K/V for GQA (NPU npu_fusion_attention doesn't support native GQA)
             if self._n_rep > 1:
                 k = k.repeat_interleave(self._n_rep, dim=1)
                 v = v.repeat_interleave(self._n_rep, dim=1)
 
-            # Get the causal mask slice for current sequence length
+            # Slice causal mask to current sequence length
             atten_mask = self._npu_causal_mask[:seq_len, :seq_len]
-
             attn_out = torch_npu.npu_fusion_attention(
                 query=q,
                 key=k,
