@@ -26,9 +26,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.platforms import current_omni_platform
 
-if current_omni_platform.is_npu():
-    import torch_npu
-
 logger = init_logger(__name__)
 
 
@@ -125,6 +122,9 @@ class CodePredictorAttention(nn.Module):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
+        assert self.num_heads % self.num_kv_heads == 0
+        self.is_gqa = self.num_kv_heads != self.num_heads
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_dim = getattr(
             config,
             "head_dim",
@@ -132,7 +132,7 @@ class CodePredictorAttention(nn.Module):
         )
         self.hidden_size = config.hidden_size
         self.scaling = self.head_dim**-0.5
-        self._use_gqa = self.num_kv_heads != self.num_heads
+        self.max_seq_len = getattr(config, "num_code_groups", 16) + 1
 
         # Separate q/k/v projections matching HF (no fused packing)
         bias = getattr(config, "attention_bias", False)
@@ -145,15 +145,37 @@ class CodePredictorAttention(nn.Module):
 
         # NPU: pre-allocate causal mask for npu_fusion_attention
         if current_omni_platform.is_npu():
-            # GQA expansion ratio (NPU npu_fusion_attention doesn't support native GQA)
-            self._n_rep = self.num_heads // self.num_kv_heads
-            # Causal mask sized to actual max sequence length
-            self._max_seq_len = getattr(config, "num_code_groups", 16) + 1
             causal_mask = torch.triu(
-                torch.ones(self._max_seq_len, self._max_seq_len, dtype=torch.bool),
+                torch.ones(self.max_seq_len, self.max_seq_len, dtype=torch.bool),
                 diagonal=1,
             )
             self.register_buffer("_npu_causal_mask", causal_mask, persistent=False)
+
+    def _forward_npu_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds max {self.max_seq_len}")
+
+        if self.is_gqa:
+            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+        atten_mask = self._npu_causal_mask[:seq_len, :seq_len]
+        return torch_npu.npu_fusion_attention(
+            query=q,
+            key=k,
+            value=v,
+            head_num=self.num_heads,
+            input_layout="BNSD",
+            atten_mask=atten_mask,
+            scale=self.scaling,
+        )[0]
 
     def forward(
         self,
@@ -176,28 +198,7 @@ class CodePredictorAttention(nn.Module):
         k = (k * cos) + (_rotate_half(k) * sin)
 
         if current_omni_platform.is_npu():
-            # NPU path: use npu_fusion_attention with explicit GQA expansion
-            if seq_len > self._max_seq_len:
-                raise ValueError(
-                    f"Sequence length {seq_len} exceeds max {self._max_seq_len}"
-                )
-
-            # Expand K/V for GQA (NPU npu_fusion_attention doesn't support native GQA)
-            if self._n_rep > 1:
-                k = k.repeat_interleave(self._n_rep, dim=1)
-                v = v.repeat_interleave(self._n_rep, dim=1)
-
-            # Slice causal mask to current sequence length
-            atten_mask = self._npu_causal_mask[:seq_len, :seq_len]
-            attn_out = torch_npu.npu_fusion_attention(
-                query=q,
-                key=k,
-                value=v,
-                head_num=self.num_heads,
-                input_layout="BNSD",
-                atten_mask=atten_mask,
-                scale=self.scaling,
-            )[0]
+            attn_out = self._forward_npu_attention(q, k, v, seq_len)
         else:
             # GPU/CPU path: use PyTorch's SDPA with native GQA support
             attn_out = F.scaled_dot_product_attention(
@@ -206,7 +207,7 @@ class CodePredictorAttention(nn.Module):
                 v,
                 scale=self.scaling,
                 is_causal=True,
-                enable_gqa=self._use_gqa,
+                enable_gqa=self.is_gqa,
             )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
@@ -547,6 +548,8 @@ class CodePredictorWrapper(nn.Module):
         """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
         max_seq = self._num_groups + 1
         proj_buf = self._proj_buf
+
+        import torch_npu
 
         for bsz in self._bucket_sizes:
             static_input = proj_buf[:bsz, :max_seq, :]
