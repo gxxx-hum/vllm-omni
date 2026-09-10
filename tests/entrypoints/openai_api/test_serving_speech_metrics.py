@@ -5,9 +5,11 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
+from vllm_omni.entrypoints.openai import serving_speech as speech_module
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
@@ -177,3 +179,90 @@ async def test_non_streaming_speech_does_not_observe_ttfp():
     assert audio_data
     assert media_type == "audio/pcm"
     assert metrics.ttfp_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flush_only", [False, True])
+@pytest.mark.parametrize("response_format", ["pcm", "wav"])
+async def test_resampled_speech_records_flush_with_audio_producer(monkeypatch, flush_only, response_format):
+    metrics = _MetricsStub()
+    serving = _serving(metrics)
+    clock = {"now": 0.0}
+    finalized = []
+    original_finalize = speech_module.observe_audio_streaming_finalize
+
+    def capture_finalize(*args, **kwargs):
+        finalized.append(kwargs)
+        original_finalize(*args, **kwargs)
+
+    class BufferedResampler:
+        def __init__(self, source_rate, target_rate):
+            assert (source_rate, target_rate) == (16000, 24000)
+
+        def process(self, chunk, *, final=False):
+            clock["now"] = 0.5 if final else 0.25
+            if not final and flush_only:
+                return np.empty(0, dtype=np.float32)
+            return np.zeros(2400, dtype=np.float32)
+
+    monkeypatch.setattr(speech_module, "StreamingAudioResampler", BufferedResampler)
+    monkeypatch.setattr(speech_module, "observe_audio_streaming_finalize", capture_finalize)
+    monkeypatch.setattr(speech_module.time, "time", lambda: 100.0 + clock["now"])
+    monkeypatch.setattr(speech_module.time, "perf_counter", lambda: clock["now"])
+    # The last result is not audio and must not supply the flush metric labels.
+    non_audio = SimpleNamespace(multimodal_output={"timestamps": []}, stage_id=9, replica_id=8)
+    chunks = [
+        chunk
+        async for chunk in serving._generate_audio_chunks(
+            _generate(_result(), non_audio),
+            request_id="speech-test",
+            response_format=response_format,
+            request_start_s=0.0,
+            request_arrival_ts=100.0,
+            target_sample_rate=24000,
+        )
+    ]
+
+    if response_format == "wav":
+        assert chunks.pop(0).startswith(b"RIFF")
+    expected_arrivals = [0.5] if flush_only else [0.25, 0.5]
+    assert [len(chunk) for chunk in chunks] == [4800] * len(expected_arrivals)
+    assert metrics.ttfp_calls == [("1", "2", pytest.approx(expected_arrivals[0]))]
+    assert len(finalized) == 1
+    assert finalized[0]["sample_rate"] == 24000
+    assert finalized[0]["channels"] == 1
+    assert finalized[0]["chunk_bytes"] == [4800] * len(expected_arrivals)
+    assert finalized[0]["chunk_arrival_times_s"] == expected_arrivals
+    assert metrics.underrun_calls == [("1", "2", pytest.approx(0.0 if flush_only else 0.15))]
+    assert metrics.continuity_calls == ([("1", "2", 100)] if flush_only else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_pcm", [False, True])
+async def test_resampled_speech_without_pcm_does_not_emit_metrics(monkeypatch, empty_pcm):
+    metrics = _MetricsStub()
+    serving = _serving(metrics)
+
+    class EmptyResampler:
+        def __init__(self, source_rate, target_rate):
+            pass
+
+        def process(self, chunk, *, final=False):
+            # Also cover a nonempty flush waveform whose encoder emits no PCM.
+            return np.zeros(10 if final and empty_pcm else 0, dtype=np.float32)
+
+    monkeypatch.setattr(speech_module, "StreamingAudioResampler", EmptyResampler)
+    serving.create_audio = lambda audio_obj: SimpleNamespace(audio_data=b"", media_type="audio/pcm")
+    chunks = [
+        chunk
+        async for chunk in serving._generate_audio_chunks(
+            _generate(_result()),
+            request_id="speech-test",
+            request_arrival_ts=100.0,
+            target_sample_rate=24000,
+        )
+    ]
+    assert not any(chunks)
+    assert metrics.ttfp_calls == []
+    assert metrics.underrun_calls == []
+    assert metrics.continuity_calls == []
