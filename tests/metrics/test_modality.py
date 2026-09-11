@@ -48,6 +48,8 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_UNDERRUN_S,
     defs.AUDIO_CONTINUITY_OK_METRIC,
     defs.AUDIO_SKIPPED_REQUESTS_METRIC,
+    defs.SPEECH_STREAM_ABORTED_METRIC,
+    defs.SPEECH_STREAM_COMPLETED_METRIC,
     defs.DIFFUSION_EXEC_S,
     defs.DIFFUSION_EXEC_PER_STEP_S,
     defs.DIFFUSION_PREPROCESS_S,
@@ -70,6 +72,8 @@ class TestRegistration:
         mod.observe_audio_underrun("s", "r", 0.01)
         mod.inc_audio_continuity_ok("s", "r", 100)
         mod.inc_audio_skipped("s", "r", "malformed_codec")
+        mod.inc_speech_stream_aborted("error")
+        mod.inc_speech_stream_completed()
         mod.observe_diffusion_exec("s", "r", 0.5)
         mod.observe_diffusion_exec_per_step("s", "r", 0.01)
         mod.observe_diffusion_preprocess("s", "r", 0.01)
@@ -91,6 +95,23 @@ class TestRegistration:
 
 
 class TestAudio:
+    def test_speech_stream_abort_counter_and_disabled_logging(self):
+        model = "test-speech-stream-abort-counter"
+        metrics = OmniModalityMetrics(model_name=model)
+        disabled = OmniModalityMetrics(model_name=model, log_stats=False)
+        metrics.inc_speech_stream_completed()
+        disabled.inc_speech_stream_completed()
+        assert REGISTRY.get_sample_value(defs.SPEECH_STREAM_COMPLETED_METRIC + "_total", {"model_name": model}) == 1.0
+        for reason in ("cancelled", "closed", "engine_dead", "error"):
+            metrics.inc_speech_stream_aborted(reason)
+            disabled.inc_speech_stream_aborted(reason)
+            assert (
+                REGISTRY.get_sample_value(
+                    defs.SPEECH_STREAM_ABORTED_METRIC + "_total", {"model_name": model, "reason": reason}
+                )
+                == 1.0
+            )
+
     def test_audio_ttfp_observed(self, mod: OmniModalityMetrics) -> None:
         stage, replica = "talker_ttfp", "0"
         mod.observe_audio_ttfp(stage, replica, 0.42)

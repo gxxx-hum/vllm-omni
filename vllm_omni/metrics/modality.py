@@ -79,6 +79,16 @@ _audio_skipped_family = Counter(
     "Silent-loss counter — code2wav rejected malformed codec input and returned 200 OK with empty audio.",
     labelnames=list(defs.AUDIO_SKIPPED_LABELS),
 )
+_speech_stream_aborted_family = Counter(
+    defs.SPEECH_STREAM_ABORTED_METRIC,
+    "Speech audio generators terminated before normal completion, including before the first PCM payload.",
+    labelnames=["model_name", "reason"],
+)
+_speech_stream_completed_family = Counter(
+    defs.SPEECH_STREAM_COMPLETED_METRIC,
+    "Speech audio generators that completed normally; does not confirm client receipt.",
+    labelnames=["model_name"],
+)
 
 
 # ----------------------------------------------------------------------------
@@ -155,6 +165,17 @@ class OmniModalityMetrics:
         self._log_stats = log_stats
 
     # ---- Audio ------------------------------------------------------------
+
+    def inc_speech_stream_aborted(self, reason: str) -> None:
+        if not self._log_stats:
+            return
+        if reason not in {"cancelled", "closed", "engine_dead", "error"}:
+            reason = "error"
+        _speech_stream_aborted_family.labels(model_name=self._model_name, reason=reason).inc()
+
+    def inc_speech_stream_completed(self) -> None:
+        if self._log_stats:
+            _speech_stream_completed_family.labels(model_name=self._model_name).inc()
 
     def observe_audio_ttfp(self, stage: str, replica: str, ttfp_seconds: float) -> None:
         if not self._log_stats:

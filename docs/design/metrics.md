@@ -227,6 +227,23 @@ Labels: `{model_name, stage, replica}` plus the listed extra label.
 | `vllm_omni:audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
 | `vllm_omni:audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
+### Speech streaming (2)
+
+Labels: `{model_name}` plus the listed extra label.
+
+| Metric | Type | Extra label | Description |
+| -------- | ------ | ------------- | ------------- |
+| `vllm_omni:speech_stream_aborted_total` | Counter | `reason` | Interrupted audio generators, including before first PCM; reasons: `cancelled`, `closed`, `engine_dead`, `error` |
+| `vllm_omni:speech_stream_completed_total` | Counter | — | Normally completed audio generators; does not confirm client receipt |
+
+Scope: started Speech audio generators (raw/SSE/WebSocket), counted once per
+generation; WebSocket counts each sentence. Chat, non-streaming Speech, and
+failures before generator execution are excluded. Interrupted streams do not
+emit continuity or underrun samples.
+
+Interruption ratio: `aborted / (aborted + completed)`, using increments over the
+same time window and summing all reasons per model.
+
 ### Cross-stage transfer (4)
 
 Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
