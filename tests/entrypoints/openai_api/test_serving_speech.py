@@ -3294,6 +3294,7 @@ class TestStreamingResponse:
             _response_format="pcm",
             raw_request=None,
             request_start_s=None,
+            request_arrival_ts=None,
             include_sample_rate=False,
             usage_acc=None,
             tts_params=None,
