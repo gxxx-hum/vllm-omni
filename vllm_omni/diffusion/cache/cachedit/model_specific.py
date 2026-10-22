@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Model-specific Cache-DiT adapters and enablers."""
 
@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.cachedit.backend import (
     CUSTOM_DIT_ENABLERS,
+    CacheDiTEnableResult,
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
@@ -49,20 +50,24 @@ def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[in
     Returns:
         A tuple of (num_high_noise_steps, num_low_noise_steps).
     """
-    if pipeline.boundary_ratio is not None:
-        boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
-    else:
-        boundary_timestep = None
+    # Mirror the fallback forward() applies when the server pins no boundary_ratio;
+    # without it every step would land on transformer and transformer_2's context
+    # would be sized for zero steps.
+    boundary_ratio = pipeline.boundary_ratio if pipeline.boundary_ratio is not None else 0.875
+    boundary_timestep = boundary_ratio * pipeline.scheduler.config.num_train_timesteps
 
-    # Set timesteps to calculate the split
+    # Set timesteps to calculate the split. forward() re-arms the scheduler for
+    # every request, so probing it here is safe, but it must use the same flow
+    # shift: the UniPC scheduler is built unshifted and forward() applies the
+    # shift in set_timesteps, so an unshifted probe misplaces the boundary.
     device = next(pipeline.transformer.parameters()).device
-    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+    if getattr(pipeline, "_sample_solver", None) == "unipc":
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device, shift=pipeline._flow_shift)
+    else:
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
 
     timesteps = pipeline.scheduler.timesteps
-    num_high_noise_steps = 0  # high-noise steps for transformer
-    for t in timesteps:
-        if boundary_timestep is None or t >= boundary_timestep:
-            num_high_noise_steps += 1
+    num_high_noise_steps = int((timesteps >= boundary_timestep).sum())  # high-noise steps for transformer
     # low-noise steps for transformer_2
     num_low_noise_steps = num_inference_steps - num_high_noise_steps
     return num_high_noise_steps, num_low_noise_steps
@@ -105,7 +110,16 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
-        return _build_cache_context_refresh(cache_config)
+        refresh_single = _build_cache_context_refresh(cache_config)
+
+        def refresh_single_for_schedule(
+            pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+        ) -> None:
+            # A single expert denoises every timestep forward() resolved.
+            refresh_single(pipeline, len(timesteps), verbose)
+
+        pipeline._cache_dit_refresh_for_schedule = refresh_single_for_schedule
+        return refresh_single
 
     cache_dit.enable_cache(
         BlockAdapter(
@@ -161,6 +175,30 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
         refresh_trans_one(pipeline, num_high_noise_steps, verbose)
         refresh_trans_two(pipeline, num_low_noise_steps, verbose)
 
+    def refresh_cache_context_for_schedule(
+        pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+    ) -> None:
+        """Size both experts' contexts to the timesteps forward() is about to denoise.
+
+        The runner refreshes before forward() resolves this request's solver, flow
+        shift and boundary, so its split can follow the previous request's
+        schedule. forward() calls this once they are resolved; the counts follow
+        diffuse(), which runs transformer for t >= boundary_timestep and
+        transformer_2 below it.
+        """
+        if boundary_timestep is None:
+            num_high_noise_steps = len(timesteps)
+        else:
+            num_high_noise_steps = int((timesteps >= boundary_timestep).sum())
+        num_low_noise_steps = len(timesteps) - num_high_noise_steps
+        # An expert that gets no step in this request never runs, so its context
+        # can keep the reset the runner already gave it.
+        if num_high_noise_steps > 0:
+            refresh_trans_one(pipeline, num_high_noise_steps, verbose)
+        if num_low_noise_steps > 0:
+            refresh_trans_two(pipeline, num_low_noise_steps, verbose)
+
+    pipeline._cache_dit_refresh_for_schedule = refresh_cache_context_for_schedule
     return refresh_cache_context
 
 
@@ -836,6 +874,106 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def _get_magi2_transformer_block(pipeline: Any) -> torch.nn.Module:
+    return pipeline.transformer.block
+
+
+def enable_cache_for_magi2(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache only MAGI-2's repeated native transformer-layer stack.
+
+    The pre/post adapters still execute on every denoising step. MAGI-2 either
+    packs both CFG branches into one transformer call or assigns one branch to
+    each CFG-parallel rank. In both layouts each rank invokes this stack once
+    per denoising step, so it remains a non-separate-CFG Pattern-3 stack.
+    """
+
+    transformer_block = _get_magi2_transformer_block(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer_block,
+        blocks=[transformer_block.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=False,
+        check_forward_pattern=True,
+    )
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter,
+        get_pipeline_transformer=_get_magi2_transformer_block,
+    )
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
+def _get_mammothmoda2_transformer(pipeline: Any) -> torch.nn.Module:
+    return pipeline.gen_transformer
+
+
+def enable_cache_for_mammothmoda2(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache only MammothModa2's repeated main DiT stack.
+
+    ``Transformer2DModel`` runs three Q-Former refiners (noise / ref-image /
+    context) whose inputs change every denoise step, plus the ``layers``
+    stack that dominates per-step compute. Only ``layers`` is a repeated
+    residual stack, so the ``BlockAdapter`` wraps it and the refiners stay
+    outside the cached region. Blocks take ``hidden_states`` plus keyword
+    step context and return only hidden states (``Pattern_3``).
+
+    The pipeline runs sequential CFG: each conditional forward is followed by
+    an unconditional forward. cache-dit tells cond/uncond apart purely by
+    transformer-forward parity (``has_separate_cfg=True``), so the
+    ``cfg_range`` optimization that skips the unconditional pass outside the
+    interval would desync that accounting. Like Cosmos3, we keep the passes
+    paired and neutralize CFG via scale=1.0 outside the interval; the
+    pipeline also disables hooks for no-CFG requests (single forward per
+    step), whose parity the accounting cannot represent.
+    """
+    pipeline._cache_dit_requires_paired_cfg = True
+    transformer = _get_mammothmoda2_transformer(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=True,
+        check_forward_pattern=True,
+    )
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter,
+        get_pipeline_transformer=_get_mammothmoda2_transformer,
+    )
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
+def enable_cache_for_kandinsky6(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
+    """Cache-DiT over K6 visual blocks only.
+
+    Text and audio block lists are not one residual chain with the visual
+    stack. If the block adapter rejects the fused ``(video, audio)`` return,
+    fall back to the same step-level velocity cache MagCache uses.
+    """
+    transformer = pipeline.transformer
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.visual_transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_0],
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
+    try:
+        return enable_cache_for_dit(pipeline, cache_config, block_adapter)
+    except Exception as exc:
+        logger.warning("Cache-DiT block adapter failed for Kandinsky 6 (%s); using step cache", exc)
+        from vllm_omni.diffusion.models.kandinsky6.cache_accel import attach_mag_cache
+
+        attach_mag_cache(transformer, threshold=0.24, max_skip_steps=3, retention_ratio=0.1)
+
+        def _refresh(*_args, **_kwargs):
+            return None
+
+        return _refresh
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -853,6 +991,9 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "Kandinsky6TI2VAPipeline": enable_cache_for_kandinsky6,
+            "Magi2Pipeline": enable_cache_for_magi2,
+            "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
         }
     )
 

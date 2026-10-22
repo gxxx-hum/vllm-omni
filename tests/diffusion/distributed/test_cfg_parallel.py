@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for CFG (Classifier-Free Guidance) parallel functionality.
 
 CPU tests mock the CFG process group and validate mixin logic without GPUs.
@@ -17,7 +17,12 @@ import torch
 
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.distributed import parallel_state
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _dispatch_branches, _wrap
+from vllm_omni.diffusion.distributed.cfg_parallel import (
+    CFGParallelMixin,
+    _dispatch_branches,
+    _get_cfg_world_size_or_one,
+    _wrap,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     get_classifier_free_guidance_rank,
@@ -27,8 +32,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=2)
-_L4_THREE_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=3)
+_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
+_L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=3)
 
 
 def _set_random_seeds(seed: int) -> None:
@@ -391,6 +396,68 @@ def _build_pipeline_on_device(
 # ---------------------------------------------------------------------------
 # CPU: mixin logic via mocked CFG groups (no GPU / no torch.distributed spawn)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_cfg_world_size_defaults_only_when_group_is_uninitialized(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(parallel_state, "_CFG", None)
+
+    assert not parallel_state.is_cfg_group_initialized()
+    assert _get_cfg_world_size_or_one() == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_cfg_world_size_does_not_swallow_initialized_group_errors(monkeypatch: pytest.MonkeyPatch):
+    class BrokenCfgGroup:
+        @property
+        def world_size(self) -> int:
+            raise AssertionError("CFG group is broken")
+
+    monkeypatch.setattr(parallel_state, "_CFG", BrokenCfgGroup())
+
+    assert parallel_state.is_cfg_group_initialized()
+    with pytest.raises(AssertionError, match="CFG group is broken"):
+        _get_cfg_world_size_or_one()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_cfg_defaults_to_sequential_without_initialized_group():
+    pipeline = _build_pipeline_on_device(
+        TestCFGPipeline,
+        hidden_dim=32,
+        model_seed=42,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    positive_kwargs, negative_kwargs = _make_two_branch_inputs(
+        batch_size=1,
+        channels=4,
+        height=4,
+        width=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        input_seed=123,
+    )
+
+    with torch.no_grad():
+        positive = pipeline.predict_noise(**positive_kwargs)
+        negative = pipeline.predict_noise(**negative_kwargs)
+        actual = pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=5.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+
+    expected = negative + 5.0 * (positive - negative)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.core_model
@@ -942,7 +1009,7 @@ def _run_multi_branch_gpu_parity(
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
 @pytest.mark.parametrize("extra_kwargs", [None, {"step_i": 1}])
@@ -987,3 +1054,86 @@ def test_predict_noise_with_multi_branch_cfg_parity(
         batch_size=batch_size,
         cfg_normalize=cfg_normalize,
     )
+
+
+class _FlagRecordingTransformer(SimpleTransformer):
+    """Records ``do_true_cfg`` at each forward call."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.seen_flags: list[Any] = []
+
+    def forward(self, x: torch.Tensor, **kwargs) -> tuple[torch.Tensor]:
+        self.seen_flags.append(getattr(self, "do_true_cfg", None))
+        return super().forward(x, **kwargs)
+
+
+class _FlagRecordingPipeline(CFGParallelMixin):
+    def __init__(self) -> None:
+        _set_random_seeds(0)
+        self.transformer = _FlagRecordingTransformer(in_channels=4, hidden_dim=32)
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_sequential_cfg_marks_transformer_for_per_branch_caches():
+    """``predict_noise_maybe_with_cfg`` sets ``transformer.do_true_cfg`` per call and clears it without CFG."""
+    pipeline = _FlagRecordingPipeline()
+    positive_kwargs, negative_kwargs = _make_two_branch_inputs(
+        batch_size=1, channels=4, height=4, width=4, dtype=torch.float32, device=torch.device("cpu"), input_seed=1
+    )
+
+    with torch.no_grad():
+        pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=4.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+        assert pipeline.transformer.seen_flags == [True, True]
+
+        pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=False,
+            true_cfg_scale=1.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=None,
+            cfg_normalize=False,
+        )
+
+    assert pipeline.transformer.seen_flags == [True, True, False]
+    assert pipeline.transformer.do_true_cfg is False
+
+
+class _NoTransformerPipeline(CFGParallelMixin):
+    """Pipelines may route predict_noise to a module not named ``transformer``."""
+
+    def __init__(self) -> None:
+        _set_random_seeds(0)
+        self.denoiser = SimpleTransformer(in_channels=4, hidden_dim=32)
+
+    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return self.denoiser(*args, **kwargs)[0]
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_sequential_cfg_without_transformer_attribute():
+    pipeline = _NoTransformerPipeline()
+    positive_kwargs, negative_kwargs = _make_two_branch_inputs(
+        batch_size=1, channels=4, height=4, width=4, dtype=torch.float32, device=torch.device("cpu"), input_seed=2
+    )
+
+    with torch.no_grad():
+        out = pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=4.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+
+    assert out.shape == (1, 4, 4, 4)
+    assert not hasattr(pipeline, "transformer")
