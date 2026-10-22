@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ming-TTS (dense) serving adapter."""
 
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,9 @@ class MingTTSAdapter(ARTTSAdapter):
     # model-type detection go through the architecture. ``ming_flash_omni_tts``
     # is the model that owns the ``ming_tts`` *stage key*, and is matched first.
     name = "ming_tts"
+    # Stage-0 ignores sampling_metadata; the latent sampler reads its own
+    # temperature from additional_information.
+    supports_temperature = False
     model_archs = frozenset({"MingTTSForConditionalGeneration"})
     arch_identifies_entry_stage = True
     # Ming dense deploys its AR stage as the generic ``model_stage="llm"``, so

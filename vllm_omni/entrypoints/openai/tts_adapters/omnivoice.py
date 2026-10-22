@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """OmniVoice serving adapter (AR engine_client path).
 
 OmniVoice can also be served through the pure-diffusion engine via
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
 class OmniVoiceAdapter(ARTTSAdapter):
     stage_keys = frozenset({"omnivoice_generator"})
     name = "omnivoice"
+    # The generator samples with the config's position/class temperatures, not
+    # the stage SamplingParams.
+    supports_temperature = False
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input or not request.input.strip():

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MingFlashOmniTTS serving adapter."""
 
 from typing import TYPE_CHECKING
@@ -21,6 +22,9 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
     # is no static speaker list to surface here.
     stage_keys = frozenset({"ming_tts"})
     name = "ming_flash_omni_tts"
+    # The talker's sample() is a no-op; its temperature comes from
+    # additional_information, not SamplingParams.
+    supports_temperature = False
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate Ming-flash-omni standalone-talker request parameters."""

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Voxtral TTS serving adapter."""
 
 from typing import TYPE_CHECKING, Any
@@ -15,6 +16,9 @@ if TYPE_CHECKING:
 class VoxtralTTSAdapter(ARTTSAdapter):
     stage_keys = frozenset({"audio_generation"})
     name = "voxtral_tts"
+    # Stage-0 logits are fixed (audio-token / EOS); acoustic frames come from
+    # the flow-matching transformer, so SamplingParams.temperature has no effect.
+    supports_temperature = False
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate Voxtral TTS request parameters. Returns error message or None."""

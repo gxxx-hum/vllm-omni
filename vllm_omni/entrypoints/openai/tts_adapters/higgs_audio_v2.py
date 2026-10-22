@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Higgs-Audio v2 serving adapter."""
 
 from typing import TYPE_CHECKING, Any
@@ -14,6 +15,10 @@ if TYPE_CHECKING:
 class HiggsAudioV2Adapter(ARTTSAdapter):
     stage_keys = frozenset({"higgs_audio_v2"})
     name = "higgs_audio_v2"
+    # Audio codebooks are sampled in the talker with fixed settings
+    # (temperature 1.0, top-k 50, top-p 0.95); SamplingParams.temperature never
+    # reaches them.
+    supports_temperature = False
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate higgs_audio_v2 request parameters. Returns error message or None.
